@@ -1,22 +1,24 @@
 //! Anchor — file integrity monitor.
 //!
 //! Walk a tree, hash every regular file, store a baseline, then re-check
-//! and report added / removed / changed paths. Pure Rust. Zero dependencies.
+//! and report added / removed / changed paths. Live watch via pure-std poll.
+//! Webhooks and content diffs included.
 //!
-//! Hash is SHA-256 implemented from the FIPS 180-4 constants (no external crate).
+//! SHA-256 is implemented from FIPS 180-4 constants (no crypto crate).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::time::SystemTime;
 
-/// One recorded file in a baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub path: String,
     pub size: u64,
     pub mtime_secs: u64,
+    pub mode: u32,
     pub sha256: [u8; 32],
 }
 
@@ -26,33 +28,65 @@ impl Entry {
     }
 }
 
-/// In-memory baseline: path → entry.
 #[derive(Debug, Default, Clone)]
 pub struct Baseline {
     pub entries: BTreeMap<String, Entry>,
     pub created_at: u64,
 }
 
-/// Diff between two baselines (or baseline vs live scan).
+#[derive(Debug, Clone)]
+pub struct Change {
+    pub path: String,
+    pub kind: ChangeKind,
+    pub content_diff: Option<String>,
+    pub old_hash: Option<String>,
+    pub new_hash: Option<String>,
+    pub old_mode: Option<u32>,
+    pub new_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Modified,
+    ModeChanged,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Added => "added",
+            ChangeKind::Removed => "removed",
+            ChangeKind::Modified => "modified",
+            ChangeKind::ModeChanged => "mode_changed",
+        }
+    }
+    pub fn marker(self) -> char {
+        match self {
+            ChangeKind::Added => '+',
+            ChangeKind::Removed => '-',
+            ChangeKind::Modified => '~',
+            ChangeKind::ModeChanged => 'm',
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Report {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
-    pub changed: Vec<String>,
+    pub changes: Vec<Change>,
     pub unchanged: usize,
 }
 
 impl Report {
     pub fn is_clean(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+        self.changes.is_empty()
     }
-
     pub fn total_issues(&self) -> usize {
-        self.added.len() + self.removed.len() + self.changed.len()
+        self.changes.len()
     }
 }
 
-/// Walk `root`, hash every regular file, skip names matching `ignores`.
 pub fn scan<P: AsRef<Path>>(root: P, ignores: &[&str]) -> io::Result<Baseline> {
     let root = root.as_ref();
     let mut entries = BTreeMap::new();
@@ -63,42 +97,116 @@ pub fn scan<P: AsRef<Path>>(root: P, ignores: &[&str]) -> io::Result<Baseline> {
     })
 }
 
-/// Compare `live` against `baseline`.
-pub fn diff(baseline: &Baseline, live: &Baseline) -> Report {
+pub fn hash_path(path: &Path) -> io::Result<Entry> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let hash = hash_file(path)?;
+    let mtime_secs = meta
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(Entry {
+        path: path.to_string_lossy().replace('\\', "/"),
+        size: meta.len(),
+        mtime_secs,
+        mode: file_mode(&meta),
+        sha256: hash,
+    })
+}
+
+pub fn diff(baseline: &Baseline, live: &Baseline, root: &Path, with_content_diff: bool) -> Report {
     let mut report = Report::default();
     for (path, base) in &baseline.entries {
         match live.entries.get(path) {
-            None => report.removed.push(path.clone()),
+            None => report.changes.push(Change {
+                path: path.clone(),
+                kind: ChangeKind::Removed,
+                content_diff: None,
+                old_hash: Some(base.hex_hash()),
+                new_hash: None,
+                old_mode: Some(base.mode),
+                new_mode: None,
+            }),
             Some(cur) => {
-                if cur.sha256 != base.sha256 || cur.size != base.size {
-                    report.changed.push(path.clone());
+                let hash_changed = cur.sha256 != base.sha256 || cur.size != base.size;
+                let mode_changed = cur.mode != base.mode;
+                if hash_changed || mode_changed {
+                    let kind = if hash_changed {
+                        ChangeKind::Modified
+                    } else {
+                        ChangeKind::ModeChanged
+                    };
+                    let content_diff = if with_content_diff && hash_changed {
+                        content_diff_for(root, path)
+                    } else {
+                        None
+                    };
+                    report.changes.push(Change {
+                        path: path.clone(),
+                        kind,
+                        content_diff,
+                        old_hash: Some(base.hex_hash()),
+                        new_hash: Some(cur.hex_hash()),
+                        old_mode: Some(base.mode),
+                        new_mode: Some(cur.mode),
+                    });
                 } else {
                     report.unchanged += 1;
                 }
             }
         }
     }
-    for path in live.entries.keys() {
+    for (path, cur) in &live.entries {
         if !baseline.entries.contains_key(path) {
-            report.added.push(path.clone());
+            report.changes.push(Change {
+                path: path.clone(),
+                kind: ChangeKind::Added,
+                content_diff: None,
+                old_hash: None,
+                new_hash: Some(cur.hex_hash()),
+                old_mode: None,
+                new_mode: Some(cur.mode),
+            });
         }
     }
     report
 }
 
-/// Write baseline to a portable text file.
+fn content_diff_for(root: &Path, rel: &str) -> Option<String> {
+    let path = root.join(rel);
+    let data = fs::read(&path).ok()?;
+    if data.len() > 256 * 1024 {
+        return Some("(file too large for content diff)".into());
+    }
+    let new_text = String::from_utf8(data).ok()?;
+    Some(format!(
+        "--- previous (hash changed)\n+++ {}\n{}",
+        rel,
+        new_text
+            .lines()
+            .map(|l| format!("+ {}", l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
 pub fn save_baseline<P: AsRef<Path>>(baseline: &Baseline, path: P) -> io::Result<()> {
     let mut f = File::create(path)?;
-    writeln!(f, "ANCHOR1")?;
+    writeln!(f, "ANCHOR2")?;
     writeln!(f, "{}", baseline.created_at)?;
     writeln!(f, "{}", baseline.entries.len())?;
     for (path, e) in &baseline.entries {
         writeln!(
             f,
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             hex(&e.sha256),
             e.size,
             e.mtime_secs,
+            e.mode,
             path
         )?;
     }
@@ -106,24 +214,27 @@ pub fn save_baseline<P: AsRef<Path>>(baseline: &Baseline, path: P) -> io::Result
     Ok(())
 }
 
-/// Load a baseline written by `save_baseline`.
 pub fn load_baseline<P: AsRef<Path>>(path: P) -> io::Result<Baseline> {
     let text = fs::read_to_string(path)?;
     let mut lines = text.lines();
     let magic = lines
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty baseline"))?;
-    if magic != "ANCHOR1" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not an anchor baseline",
-        ));
-    }
+    let version = match magic {
+        "ANCHOR1" => 1,
+        "ANCHOR2" => 2,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not an anchor baseline",
+            ))
+        }
+    };
     let created_at: u64 = lines
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad created_at"))?;
-    let count: usize = lines
+    let _count: usize = lines
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad count"))?;
@@ -133,38 +244,117 @@ pub fn load_baseline<P: AsRef<Path>>(path: P) -> io::Result<Baseline> {
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(4, ' ');
-        let hash_hex = parts
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing hash"))?;
-        let size: u64 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad size"))?;
-        let mtime_secs: u64 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad mtime"))?;
-        let path = parts
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing path"))?
-            .to_string();
-        let sha256 = parse_hex32(hash_hex)?;
-        entries.insert(
-            path.clone(),
-            Entry {
-                path,
-                size,
-                mtime_secs,
-                sha256,
-            },
-        );
+        if version == 1 {
+            let mut parts = line.splitn(4, ' ');
+            let hash_hex = parts.next().ok_or_invalid("hash")?;
+            let size: u64 = parts.next().and_then(|s| s.parse().ok()).ok_or_invalid("size")?;
+            let mtime_secs: u64 = parts.next().and_then(|s| s.parse().ok()).ok_or_invalid("mtime")?;
+            let path = parts.next().ok_or_invalid("path")?.to_string();
+            let sha256 = parse_hex32(hash_hex)?;
+            entries.insert(
+                path.clone(),
+                Entry {
+                    path,
+                    size,
+                    mtime_secs,
+                    mode: 0,
+                    sha256,
+                },
+            );
+        } else {
+            let mut parts = line.splitn(5, ' ');
+            let hash_hex = parts.next().ok_or_invalid("hash")?;
+            let size: u64 = parts.next().and_then(|s| s.parse().ok()).ok_or_invalid("size")?;
+            let mtime_secs: u64 = parts.next().and_then(|s| s.parse().ok()).ok_or_invalid("mtime")?;
+            let mode: u32 = parts.next().and_then(|s| s.parse().ok()).ok_or_invalid("mode")?;
+            let path = parts.next().ok_or_invalid("path")?.to_string();
+            let sha256 = parse_hex32(hash_hex)?;
+            entries.insert(
+                path.clone(),
+                Entry {
+                    path,
+                    size,
+                    mtime_secs,
+                    mode,
+                    sha256,
+                },
+            );
+        }
     }
-    let _ = count;
     Ok(Baseline {
         entries,
         created_at,
     })
+}
+
+trait OkOrInvalid<T> {
+    fn ok_or_invalid(self, what: &str) -> io::Result<T>;
+}
+impl<T> OkOrInvalid<T> for Option<T> {
+    fn ok_or_invalid(self, what: &str) -> io::Result<T> {
+        self.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing/bad {}", what))
+        })
+    }
+}
+
+pub fn post_webhook(url: &str, json_body: &str) -> io::Result<()> {
+    let (host, port, path, _) = parse_url(url)?;
+    let addr = format!("{}:{}", host, port);
+    let mut stream = TcpStream::connect(&addr)?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: anchor/0.2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, host, json_body.len(), json_body
+    );
+    stream.write_all(req.as_bytes())?;
+    let mut resp = String::new();
+    let _ = stream.read_to_string(&mut resp);
+    Ok(())
+}
+
+pub fn webhook_payload(report: &Report, root: &str) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("**anchor** integrity alert on `{}`", root));
+    for c in &report.changes {
+        lines.push(format!("`{}` **{}** {}", c.kind.marker(), c.kind.as_str(), c.path));
+    }
+    let content = lines.join("\n");
+    let escaped = content
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "");
+    format!(r#"{{"content":"{}"}}"#, escaped)
+}
+
+fn parse_url(url: &str) -> io::Result<(String, u16, String, bool)> {
+    let url = url.trim();
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "url must start with http:// or https://",
+        ));
+    };
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = if let Some(i) = hostport.rfind(':') {
+        let p: u16 = hostport[i + 1..]
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
+        (hostport[..i].to_string(), p)
+    } else {
+        let p = if scheme == "https" { 443 } else { 80 };
+        (hostport.to_string(), p)
+    };
+    Ok((host, port, path.to_string(), scheme == "https"))
 }
 
 fn walk(
@@ -203,6 +393,7 @@ fn walk(
                 path: rel,
                 size: meta.len(),
                 mtime_secs,
+                mode: file_mode(&meta),
                 sha256: hash,
             },
         );
@@ -227,14 +418,24 @@ fn walk(
 
 fn should_ignore(name: &str, ignores: &[&str]) -> bool {
     for pat in ignores {
-        if pat.is_empty() {
-            continue;
-        }
-        if name == *pat || name.ends_with(pat) || name.contains(pat) {
+        if !pat.is_empty() && (name == *pat || name.ends_with(pat) || name.contains(pat)) {
             return true;
         }
     }
     false
+}
+
+fn file_mode(meta: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
 }
 
 fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
@@ -312,7 +513,6 @@ impl Sha256 {
             bit_len: 0,
         }
     }
-
     fn update(&mut self, data: &[u8]) {
         for &b in data {
             self.buffer[self.buffer_len] = b;
@@ -324,7 +524,6 @@ impl Sha256 {
             }
         }
     }
-
     fn finalize(mut self) -> [u8; 32] {
         let bit_len = self.bit_len + (self.buffer_len as u64) * 8;
         self.buffer[self.buffer_len] = 0x80;
@@ -343,14 +542,12 @@ impl Sha256 {
         }
         self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
         self.compress();
-
         let mut out = [0u8; 32];
         for (i, &w) in self.state.iter().enumerate() {
             out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
         }
         out
     }
-
     fn compress(&mut self) {
         const K: [u32; 64] = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -364,7 +561,6 @@ impl Sha256 {
             0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
             0xc67178f2,
         ];
-
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -382,7 +578,6 @@ impl Sha256 {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-
         let mut a = self.state[0];
         let mut b = self.state[1];
         let mut c = self.state[2];
@@ -391,7 +586,6 @@ impl Sha256 {
         let mut f = self.state[5];
         let mut g = self.state[6];
         let mut h = self.state[7];
-
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
@@ -403,7 +597,6 @@ impl Sha256 {
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let t2 = s0.wrapping_add(maj);
-
             h = g;
             g = f;
             f = e;
@@ -413,7 +606,6 @@ impl Sha256 {
             b = a;
             a = t1.wrapping_add(t2);
         }
-
         self.state[0] = self.state[0].wrapping_add(a);
         self.state[1] = self.state[1].wrapping_add(b);
         self.state[2] = self.state[2].wrapping_add(c);
@@ -433,9 +625,8 @@ mod tests {
     fn sha256_empty() {
         let mut h = Sha256::new();
         h.update(b"");
-        let dig = h.finalize();
         assert_eq!(
-            hex(&dig),
+            hex(&h.finalize()),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
@@ -444,9 +635,8 @@ mod tests {
     fn sha256_abc() {
         let mut h = Sha256::new();
         h.update(b"abc");
-        let dig = h.finalize();
         assert_eq!(
-            hex(&dig),
+            hex(&h.finalize()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -464,26 +654,30 @@ mod tests {
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("a.txt"), b"hello").unwrap();
         fs::write(dir.join("sub/b.txt"), b"world").unwrap();
-
         let base = scan(&dir, &[]).unwrap();
         assert_eq!(base.entries.len(), 2);
-
         let path = dir.join("base.anchor");
         save_baseline(&base, &path).unwrap();
         let loaded = load_baseline(&path).unwrap();
         assert_eq!(loaded.entries.len(), 2);
-
         fs::write(dir.join("a.txt"), b"HELLO").unwrap();
         fs::write(dir.join("c.txt"), b"new").unwrap();
         fs::remove_file(dir.join("sub/b.txt")).unwrap();
-
         let live = scan(&dir, &[]).unwrap();
-        let report = diff(&base, &live);
-        assert!(report.changed.iter().any(|p| p.contains("a.txt")));
-        assert!(report.removed.iter().any(|p| p.contains("b.txt")));
-        assert!(report.added.iter().any(|p| p.contains("c.txt")));
+        let report = diff(&base, &live, &dir, false);
+        assert!(report
+            .changes
+            .iter()
+            .any(|c| c.kind == ChangeKind::Modified && c.path.contains("a.txt")));
+        assert!(report
+            .changes
+            .iter()
+            .any(|c| c.kind == ChangeKind::Removed && c.path.contains("b.txt")));
+        assert!(report
+            .changes
+            .iter()
+            .any(|c| c.kind == ChangeKind::Added && c.path.contains("c.txt")));
         assert!(!report.is_clean());
-
         let _ = fs::remove_dir_all(&dir);
     }
 }
