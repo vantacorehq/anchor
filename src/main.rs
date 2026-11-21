@@ -1,8 +1,14 @@
 //! anchor — file integrity monitor CLI.
 
-use anchor::{diff, load_baseline, save_baseline, scan, Report};
+use anchor::{
+    diff, hash_path, load_baseline, post_webhook, save_baseline, scan, webhook_payload,
+    Report,
+};
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -10,86 +16,11 @@ fn main() {
         usage();
         process::exit(1);
     }
-
-    let cmd = args[0].as_str();
-    match cmd {
-        "init" | "baseline" => {
-            let root = args.get(1).map(|s| s.as_str()).unwrap_or(".");
-            let out = args
-                .get(2)
-                .map(|s| s.as_str())
-                .unwrap_or(".anchor/baseline");
-            let ignores = default_ignores();
-            eprintln!("scanning {} …", root);
-            match scan(root, &ignores) {
-                Ok(base) => {
-                    if let Some(parent) = std::path::Path::new(out).parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(e) = save_baseline(&base, out) {
-                        eprintln!("write failed: {}", e);
-                        process::exit(2);
-                    }
-                    println!("baseline: {} files → {}", base.entries.len(), out);
-                }
-                Err(e) => {
-                    eprintln!("scan failed: {}", e);
-                    process::exit(2);
-                }
-            }
-        }
-        "check" => {
-            let root = args.get(1).map(|s| s.as_str()).unwrap_or(".");
-            let base_path = args
-                .get(2)
-                .map(|s| s.as_str())
-                .unwrap_or(".anchor/baseline");
-            let ignores = default_ignores();
-            let baseline = match load_baseline(base_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("load baseline: {}", e);
-                    process::exit(2);
-                }
-            };
-            eprintln!("checking {} against {} …", root, base_path);
-            let live = match scan(root, &ignores) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("scan failed: {}", e);
-                    process::exit(2);
-                }
-            };
-            let report = diff(&baseline, &live);
-            print_report(&report);
-            if report.is_clean() {
-                println!("ok — {} files unchanged", report.unchanged);
-                process::exit(0);
-            } else {
-                println!(
-                    "FAIL — {} issue(s), {} unchanged",
-                    report.total_issues(),
-                    report.unchanged
-                );
-                process::exit(1);
-            }
-        }
-        "hash" => {
-            let path = match args.get(1) {
-                Some(p) => p.as_str(),
-                None => {
-                    eprintln!("usage: anchor hash <file>");
-                    process::exit(1);
-                }
-            };
-            match hash_one(path) {
-                Ok(h) => println!("{}", h),
-                Err(e) => {
-                    eprintln!("{}", e);
-                    process::exit(2);
-                }
-            }
-        }
+    match args[0].as_str() {
+        "init" | "baseline" => cmd_init(&args[1..]),
+        "check" => cmd_check(&args[1..]),
+        "watch" => cmd_watch(&args[1..]),
+        "hash" => cmd_hash(&args[1..]),
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("unknown command: {}", other);
@@ -100,68 +31,254 @@ fn main() {
 }
 
 fn default_ignores() -> Vec<&'static str> {
-    vec![
-        ".git",
-        ".anchor",
-        "target",
-        "node_modules",
-        ".DS_Store",
-        "Cargo.lock",
-    ]
+    vec![".git", ".anchor", "target", "node_modules", ".DS_Store", "Cargo.lock"]
 }
 
-fn print_report(r: &Report) {
-    for p in &r.added {
-        println!("  + {}", p);
-    }
-    for p in &r.removed {
-        println!("  - {}", p);
-    }
-    for p in &r.changed {
-        println!("  ~ {}", p);
-    }
+struct Flags {
+    root: PathBuf,
+    baseline: PathBuf,
+    webhook: Option<String>,
+    show_diff: bool,
+    interval_ms: u64,
 }
 
-fn hash_one(path: &str) -> std::io::Result<String> {
-    use std::fs::File;
-    use std::io::Read;
-    let p = std::path::Path::new(path);
-    if !p.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "not a file",
-        ));
+fn parse_flags(args: &[String], defaults_root: &str, defaults_base: &str) -> Flags {
+    let mut root = PathBuf::from(defaults_root);
+    let mut baseline = PathBuf::from(defaults_base);
+    let mut webhook = None;
+    let mut show_diff = false;
+    let mut interval_ms = 1000u64;
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--webhook" => {
+                i += 1;
+                if i < args.len() {
+                    webhook = Some(args[i].clone());
+                }
+            }
+            "--diff" => show_diff = true,
+            "--interval" => {
+                i += 1;
+                if i < args.len() {
+                    interval_ms = args[i].parse().unwrap_or(1000);
+                }
+            }
+            "-h" | "--help" => {
+                usage();
+                process::exit(0);
+            }
+            s if s.starts_with('-') => {
+                eprintln!("unknown flag: {}", s);
+                process::exit(1);
+            }
+            s => positional.push(s.to_string()),
+        }
+        i += 1;
     }
-    let parent = p.parent().unwrap_or(std::path::Path::new("."));
-    let name = p.file_name().unwrap().to_string_lossy();
-    let base = scan(parent, &[])?;
-    for (rel, e) in &base.entries {
-        if rel == name.as_ref() || rel.ends_with(name.as_ref()) {
-            return Ok(e.hex_hash());
+    if let Some(r) = positional.first() {
+        root = PathBuf::from(r);
+    }
+    if let Some(b) = positional.get(1) {
+        baseline = PathBuf::from(b);
+    }
+    Flags { root, baseline, webhook, show_diff, interval_ms }
+}
+
+fn cmd_init(args: &[String]) {
+    let f = parse_flags(args, ".", ".anchor/baseline");
+    let ignores = default_ignores();
+    eprintln!("scanning {} …", f.root.display());
+    match scan(&f.root, &ignores) {
+        Ok(base) => {
+            if let Some(parent) = f.baseline.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = save_baseline(&base, &f.baseline) {
+                eprintln!("write failed: {}", e);
+                process::exit(2);
+            }
+            println!("baseline: {} files → {}", base.entries.len(), f.baseline.display());
+        }
+        Err(e) => {
+            eprintln!("scan failed: {}", e);
+            process::exit(2);
         }
     }
-    let mut f = File::open(path)?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    let dir = std::env::temp_dir().join(format!("anchor-hash-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join("f");
-    std::fs::write(&tmp, &buf)?;
-    let b = scan(&dir, &[])?;
-    let h = b.entries.values().next().map(|e| e.hex_hash()).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(h)
+}
+
+fn cmd_check(args: &[String]) {
+    let f = parse_flags(args, ".", ".anchor/baseline");
+    let ignores = default_ignores();
+    let baseline = match load_baseline(&f.baseline) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("load baseline: {}", e);
+            process::exit(2);
+        }
+    };
+    eprintln!("checking {} against {} …", f.root.display(), f.baseline.display());
+    let live = match scan(&f.root, &ignores) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("scan failed: {}", e);
+            process::exit(2);
+        }
+    };
+    let report = diff(&baseline, &live, &f.root, f.show_diff);
+    print_report(&report, f.show_diff);
+    if !report.is_clean() {
+        if let Some(ref url) = f.webhook {
+            let body = webhook_payload(&report, &f.root.display().to_string());
+            if let Err(e) = post_webhook(url, &body) {
+                eprintln!("webhook failed: {}", e);
+            } else {
+                eprintln!("webhook sent → {}", url);
+            }
+        }
+    }
+    if report.is_clean() {
+        println!("ok — {} files unchanged", report.unchanged);
+        process::exit(0);
+    } else {
+        println!("FAIL — {} issue(s), {} unchanged", report.total_issues(), report.unchanged);
+        process::exit(1);
+    }
+}
+
+fn cmd_watch(args: &[String]) {
+    let f = parse_flags(args, ".", ".anchor/baseline");
+    let ignores = default_ignores();
+    let mut baseline = match load_baseline(&f.baseline) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("no baseline — creating {}", f.baseline.display());
+            let b = scan(&f.root, &ignores).unwrap_or_else(|e| {
+                eprintln!("scan failed: {}", e);
+                process::exit(2);
+            });
+            if let Some(parent) = f.baseline.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = save_baseline(&b, &f.baseline);
+            b
+        }
+    };
+    eprintln!(
+        "watching {} every {}ms (baseline {}, {} files)",
+        f.root.display(), f.interval_ms, f.baseline.display(), baseline.entries.len()
+    );
+    if let Some(ref url) = f.webhook {
+        eprintln!("webhook: {}", url);
+    }
+    eprintln!("press Ctrl+C to stop\n");
+    loop {
+        thread::sleep(Duration::from_millis(f.interval_ms));
+        let live = match scan(&f.root, &ignores) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("scan error: {}", e);
+                continue;
+            }
+        };
+        let report = diff(&baseline, &live, &f.root, f.show_diff);
+        if report.is_clean() {
+            continue;
+        }
+        for c in &report.changes {
+            print!("[{}] {} {}", stamp(), c.kind.marker(), c.path);
+            if f.show_diff {
+                if let (Some(o), Some(n)) = (&c.old_hash, &c.new_hash) {
+                    print!("  {}→{}", &o[..12.min(o.len())], &n[..12.min(n.len())]);
+                }
+                if let (Some(om), Some(nm)) = (c.old_mode, c.new_mode) {
+                    if om != nm {
+                        print!("  mode {:o}→{:o}", om, nm);
+                    }
+                }
+            }
+            println!();
+            if f.show_diff {
+                if let Some(ref d) = c.content_diff {
+                    for line in d.lines().take(20) {
+                        println!("      {}", line);
+                    }
+                }
+            }
+        }
+        baseline = live;
+        let _ = save_baseline(&baseline, &f.baseline);
+        if let Some(ref url) = f.webhook {
+            let body = webhook_payload(&report, &f.root.display().to_string());
+            if let Err(e) = post_webhook(url, &body) {
+                eprintln!("webhook failed: {}", e);
+            }
+        }
+    }
+}
+
+fn stamp() -> String {
+    use std::time::SystemTime;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = secs % 86400;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+fn cmd_hash(args: &[String]) {
+    let path = match args.first() {
+        Some(p) => p.as_str(),
+        None => {
+            eprintln!("usage: anchor hash <file>");
+            process::exit(1);
+        }
+    };
+    match hash_path(Path::new(path)) {
+        Ok(e) => println!("{}", e.hex_hash()),
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(2);
+        }
+    }
+}
+
+fn print_report(r: &Report, show_diff: bool) {
+    for c in &r.changes {
+        println!("  {} {}", c.kind.marker(), c.path);
+        if show_diff {
+            if let (Some(o), Some(n)) = (&c.old_hash, &c.new_hash) {
+                println!("      hash {} → {}", &o[..12.min(o.len())], &n[..12.min(n.len())]);
+            }
+            if let (Some(om), Some(nm)) = (c.old_mode, c.new_mode) {
+                if om != nm {
+                    println!("      mode {:o} → {:o}", om, nm);
+                }
+            }
+            if let Some(ref d) = c.content_diff {
+                for line in d.lines() {
+                    println!("      {}", line);
+                }
+            }
+        }
+    }
 }
 
 fn usage() {
     eprintln!(
-        "anchor — file integrity monitor\n\n\
-         Usage:\n\
-           anchor init  [dir] [baseline]   create baseline (default: . / .anchor/baseline)\n\
+        "\x1b[1manchor\x1b[0m — file integrity monitor\n\n\
+         \x1b[1mUsage:\x1b[0m\n\
+           anchor init  [dir] [baseline]   create baseline\n\
            anchor check [dir] [baseline]   compare live tree to baseline\n\
-           anchor hash  <file>             print SHA-256 of one file\n\n\
-         Exit codes: 0 clean, 1 drift detected, 2 error\n\
+           anchor watch [dir] [baseline]   live poll daemon\n\
+           anchor hash  <file>             print SHA-256\n\n\
+         \x1b[1mFlags:\x1b[0m\n\
+           --diff                 show hash / mode / content hints\n\
+           --webhook <url>        POST JSON alert\n\
+           --interval <ms>        watch poll interval (default 1000)\n\n\
+         Exit: 0 clean · 1 drift · 2 error\n\
          Zero dependencies. Pure Rust."
     );
 }
