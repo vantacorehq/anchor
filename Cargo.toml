@@ -1,16 +1,17 @@
 [package]
 name = "anchor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "File integrity monitor. Hash trees, detect tampering, baseline and diff. Pure Rust. Zero dependencies."
+description = "File integrity monitor with live watch, webhooks and content diff. Pure Rust. Zero dependencies."
 readme = "README.md"
 repository = "https://github.com/vantacorehq/anchor"
-keywords = ["integrity", "security", "hash", "monitor", "audit", "rust"]
+keywords = ["integrity", "security", "hash", "monitor", "audit", "watch"]
 categories = ["command-line-utilities", "filesystem", "authentication"]
 
 [dependencies]
 # ZERO DEPENDENCIES.
+# Live watch uses a pure-std poll loop (no notify crate).
 
 [[bin]]
 name = "anchor"
