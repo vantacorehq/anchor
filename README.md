@@ -1,61 +1,110 @@
-![anchor](banner.svg)
+<p align="center">
+  <img src="banner.svg" alt="anchor" width="100%">
+</p>
 
-# anchor
+<p align="center">
+  <b>File integrity monitor</b> — baseline, live watch, webhooks, content hints.<br>
+  SHA-256 in-tree · zero dependencies · Linux / macOS / Windows
+</p>
 
-File integrity monitor. Hash trees, detect tampering, baseline and diff. Pure Rust. Zero dependencies.
+<p align="center">
+  <img src="https://img.shields.io/badge/rust-stable-orange?style=flat-square" alt="rust">
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="license">
+  <img src="https://img.shields.io/badge/deps-zero-brightgreen?style=flat-square" alt="deps">
+</p>
 
-You point it at a directory once. It records size, mtime and SHA-256 for every regular file. Later you run `check`. Anything added, removed or changed is reported. Symlinks are not followed. Exit code 1 means drift.
+---
 
 ## Why
 
-Servers, containers, release artifacts, compliance packs — someone always asks “did this tree change?”. Anchor answers that question with one binary and no crates.
+Someone always asks: *did this tree change?*  
+Servers, containers, release artifacts, compliance — **anchor** freezes a SHA-256 baseline and can sit as a live daemon that prints (and optionally webhooks) the moment anything moves.
+
+## Install
+
+```sh
+cargo install --path .
+# or
+cargo build --release && ./target/release/anchor --help
+```
 
 ## Commands
 
 ```sh
-# record a baseline
-anchor init /etc /var/lib/anchor/etc.baseline
+# 1. Freeze a tree
+anchor init /etc
+# → .anchor/baseline
 
-# later: did anything move?
-anchor check /etc /var/lib/anchor/etc.baseline
+# 2. One-shot audit
+anchor check /etc --diff
+#   ~ ssh/sshd_config
+#       hash a1b2c3d4e5f0 → 9f8e7d6c5b4a
+# FAIL — 1 issue(s), 140 unchanged
 
-# single file hash
+# 3. Live daemon (pure-std poll)
+anchor watch /etc --diff --interval 500
+# [14:02:11] ~ ssh/sshd_config  a1b2c3d4e5f0→9f8e7d6c5b4a
+# [14:02:11] + tmp/evil.sh
+
+# 4. Alert to Discord / generic webhook
+anchor watch /etc --webhook http://127.0.0.1:9000/hook
+anchor check /etc --webhook https://discord.com/api/webhooks/ID/TOKEN --diff
+
+# 5. Single-file hash
 anchor hash ./Cargo.toml
 ```
 
-Defaults: `init` / `check` on `.`, baseline at `.anchor/baseline`.
+### Flags
 
-Ignored by default: `.git`, `.anchor`, `target`, `node_modules`, `.DS_Store`, `Cargo.lock`.
+| Flag | Effect |
+|------|--------|
+| `--diff` | Print hash / mode deltas and content hints |
+| `--webhook <url>` | POST JSON alert on drift (Discord-compatible body) |
+| `--interval <ms>` | Watch poll interval (default `1000`) |
 
-## Output
+Exit codes: `0` clean · `1` drift · `2` error.
 
+## What it tracks
+
+- **SHA-256** of every regular file (FIPS 180-4, no OpenSSL)
+- **Size** and **mtime**
+- **Unix mode** bits (`m` marker on permission-only changes)
+- Symlinks are **not** followed
+
+Default ignores: `.git`, `.anchor`, `target`, `node_modules`, `.DS_Store`, `Cargo.lock`.
+
+## Live watch
+
+`anchor watch` re-scans the tree every `--interval` milliseconds. No external crates — works the same on Linux, macOS and Windows. For sub-second reaction on large trees, lower `--interval` (CPU cost scales with tree size).
+
+## Baseline format
+
+```text
+ANCHOR2
+1732214400
+2
+ba7816bf8f01… 3 1732214400 33188 a.txt
 ```
-  + new-file.conf
-  - removed.conf
-  ~ changed.conf
-FAIL — 3 issue(s), 140 unchanged
+
+Plain text. Easy to audit and `diff(1)`. `ANCHOR1` baselines still load.
+
+## Library
+
+```rust
+use anchor::{scan, diff, save_baseline, load_baseline};
+
+let base = scan("/etc", &[".git"])?;
+save_baseline(&base, "/var/lib/anchor/etc.baseline")?;
+
+let live = scan("/etc", &[".git"])?;
+let report = diff(&base, &live, std::path::Path::new("/etc"), true);
+assert!(report.is_clean());
 ```
 
-```
-ok — 143 files unchanged
-```
+## CI
 
-## Rules
-
-- Regular files only. Directories are walked; symlinks are skipped.
-- Hash is SHA-256 (FIPS 180-4), implemented in-tree. No OpenSSL, no crates.
-- Baseline format is plain text (`ANCHOR1`), one line per file, easy to audit and diff.
-- Not a daemon. Run from cron, CI, or a release pipeline.
-
-## Build
-
-```sh
-cargo test
-cargo build --release
-./target/release/anchor init .
-./target/release/anchor check .
-```
+`.github/workflows/ci.yml` runs `fmt`, `clippy`, `test` on Ubuntu / Windows / macOS and uploads release binaries.
 
 ## License
 
-MIT. Copyright 2026 vantacorehq.
+MIT · Copyright 2026 vantacorehq
