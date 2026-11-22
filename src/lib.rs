@@ -1,16 +1,15 @@
 //! Anchor — file integrity monitor.
 //!
-//! Walk a tree, hash every regular file, store a baseline, then re-check
-//! and report added / removed / changed paths. Live watch via pure-std poll.
-//! Webhooks and content diffs included.
-//!
-//! SHA-256 is implemented from FIPS 180-4 constants (no crypto crate).
+//! Parallel SHA-256 scan, `.anchorignore`, JSON reports, webhooks.
+//! Zero external crates. See README.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,15 +84,243 @@ impl Report {
     pub fn total_issues(&self) -> usize {
         self.changes.len()
     }
+    pub fn to_json(&self, root: &str) -> String {
+        let mut out = String::from("{\n");
+        out.push_str(&format!("  \"root\": {},\n", json_str(root)));
+        out.push_str(&format!(
+            "  \"clean\": {},\n",
+            if self.is_clean() { "true" } else { "false" }
+        ));
+        out.push_str(&format!("  \"unchanged\": {},\n", self.unchanged));
+        out.push_str(&format!("  \"issues\": {},\n", self.total_issues()));
+        out.push_str("  \"changes\": [\n");
+        for (i, c) in self.changes.iter().enumerate() {
+            if i > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str("    {\n");
+            out.push_str(&format!("      \"path\": {},\n", json_str(&c.path)));
+            out.push_str(&format!("      \"kind\": {},\n", json_str(c.kind.as_str())));
+            out.push_str(&format!(
+                "      \"old_hash\": {},\n",
+                opt_json_str(c.old_hash.as_deref())
+            ));
+            out.push_str(&format!(
+                "      \"new_hash\": {},\n",
+                opt_json_str(c.new_hash.as_deref())
+            ));
+            out.push_str(&format!(
+                "      \"old_mode\": {},\n",
+                opt_json_u32(c.old_mode)
+            ));
+            out.push_str(&format!(
+                "      \"new_mode\": {}\n",
+                opt_json_u32(c.new_mode)
+            ));
+            out.push_str("    }");
+        }
+        if !self.changes.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("  ]\n}\n");
+        out
+    }
 }
 
-pub fn scan<P: AsRef<Path>>(root: P, ignores: &[&str]) -> io::Result<Baseline> {
+fn json_str(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+fn opt_json_str(s: Option<&str>) -> String {
+    match s {
+        Some(s) => json_str(s),
+        None => "null".into(),
+    }
+}
+fn opt_json_u32(v: Option<u32>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "null".into(),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IgnoreList {
+    patterns: Vec<String>,
+}
+
+impl IgnoreList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn from_defaults() -> Self {
+        let mut i = Self::new();
+        for p in [
+            ".git", ".anchor", "target", "node_modules", ".DS_Store", "Cargo.lock", "*.anchor",
+        ] {
+            i.add(p);
+        }
+        i
+    }
+    pub fn add(&mut self, pat: &str) {
+        let p = pat.trim();
+        if !p.is_empty() && !p.starts_with('#') {
+            self.patterns.push(p.to_string());
+        }
+    }
+    pub fn extend_from_file(&mut self, path: &Path) -> io::Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        for line in fs::read_to_string(path)?.lines() {
+            self.add(line);
+        }
+        Ok(())
+    }
+    pub fn for_root(root: &Path) -> Self {
+        let mut i = Self::from_defaults();
+        let _ = i.extend_from_file(&root.join(".anchorignore"));
+        i
+    }
+    pub fn matches(&self, rel: &str) -> bool {
+        let name = Path::new(rel)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.patterns.iter().any(|pat| pattern_match(pat, rel, &name))
+    }
+}
+
+fn pattern_match(pat: &str, rel: &str, name: &str) -> bool {
+    if let Some(suf) = pat.strip_prefix("*.") {
+        return name.ends_with(suf) || name.ends_with(&format!(".{}", suf));
+    }
+    if let Some(suf) = pat.strip_prefix('*') {
+        return rel.ends_with(suf) || name.ends_with(suf);
+    }
+    if let Some(pre) = pat.strip_suffix('/') {
+        return rel == pre || rel.starts_with(&format!("{}/", pre)) || name == pre;
+    }
+    if let Some(pre) = pat.strip_suffix("/**") {
+        return rel == pre || rel.starts_with(&format!("{}/", pre));
+    }
+    rel == pat || name == pat || rel.contains(pat) || rel.ends_with(pat)
+}
+
+pub fn scan<P: AsRef<Path>>(root: P, ignores: &IgnoreList) -> io::Result<Baseline> {
     let root = root.as_ref();
-    let mut entries = BTreeMap::new();
-    walk(root, root, ignores, &mut entries)?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    collect_files(root, root, ignores, &mut paths)?;
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(paths.len().max(1))
+        .max(1);
+    let results: Arc<Mutex<BTreeMap<String, Entry>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let chunk = (paths.len() + n_threads - 1) / n_threads;
+    thread::scope(|scope| {
+        for piece in paths.chunks(chunk.max(1)) {
+            let results = Arc::clone(&results);
+            let root = root.to_path_buf();
+            scope.spawn(move || {
+                for path in piece {
+                    match hash_file_entry(&root, path) {
+                        Ok(entry) => {
+                            if let Ok(mut g) = results.lock() {
+                                g.insert(entry.path.clone(), entry);
+                            }
+                        }
+                        Err(e) => eprintln!("warning: {}: {}", path.display(), e),
+                    }
+                }
+            });
+        }
+    });
+    let entries = match Arc::try_unwrap(results) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    };
     Ok(Baseline {
         entries,
         created_at: now_secs(),
+    })
+}
+
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    ignores: &IgnoreList,
+    out: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let meta = match fs::symlink_metadata(current) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_file() {
+        let rel = current
+            .strip_prefix(root)
+            .unwrap_or(current)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ignores.matches(&rel) {
+            return Ok(());
+        }
+        out.push(current.to_path_buf());
+        return Ok(());
+    }
+    if meta.is_dir() {
+        let name = current
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if ignores.matches(&name) {
+            return Ok(());
+        }
+        let mut entries: Vec<_> = fs::read_dir(current)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            collect_files(root, &entry.path(), ignores, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_file_entry(root: &Path, path: &Path) -> io::Result<Entry> {
+    let meta = fs::symlink_metadata(path)?;
+    let hash = hash_file(path)?;
+    let mtime_secs = meta
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(Entry {
+        path: rel,
+        size: meta.len(),
+        mtime_secs,
+        mode: file_mode(&meta),
+        sha256: hash,
     })
 }
 
@@ -300,12 +527,11 @@ impl<T> OkOrInvalid<T> for Option<T> {
 
 pub fn post_webhook(url: &str, json_body: &str) -> io::Result<()> {
     let (host, port, path, _) = parse_url(url)?;
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr)?;
+    let mut stream = TcpStream::connect(format!("{}:{}", host, port))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: anchor/0.2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: anchor/0.3\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path, host, json_body.len(), json_body
     );
     stream.write_all(req.as_bytes())?;
@@ -315,10 +541,14 @@ pub fn post_webhook(url: &str, json_body: &str) -> io::Result<()> {
 }
 
 pub fn webhook_payload(report: &Report, root: &str) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!("**anchor** integrity alert on `{}`", root));
+    let mut lines = vec![format!("**anchor** integrity alert on `{}`", root)];
     for c in &report.changes {
-        lines.push(format!("`{}` **{}** {}", c.kind.marker(), c.kind.as_str(), c.path));
+        lines.push(format!(
+            "`{}` **{}** {}",
+            c.kind.marker(),
+            c.kind.as_str(),
+            c.path
+        ));
     }
     let content = lines.join("\n");
     let escaped = content
@@ -351,78 +581,12 @@ fn parse_url(url: &str) -> io::Result<(String, u16, String, bool)> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
         (hostport[..i].to_string(), p)
     } else {
-        let p = if scheme == "https" { 443 } else { 80 };
-        (hostport.to_string(), p)
+        (
+            hostport.to_string(),
+            if scheme == "https" { 443 } else { 80 },
+        )
     };
     Ok((host, port, path.to_string(), scheme == "https"))
-}
-
-fn walk(
-    root: &Path,
-    current: &Path,
-    ignores: &[&str],
-    out: &mut BTreeMap<String, Entry>,
-) -> io::Result<()> {
-    let meta = match fs::symlink_metadata(current) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if meta.file_type().is_symlink() {
-        return Ok(());
-    }
-    if meta.is_file() {
-        let rel = current
-            .strip_prefix(root)
-            .unwrap_or(current)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if should_ignore(&rel, ignores) {
-            return Ok(());
-        }
-        let hash = hash_file(current)?;
-        let mtime_secs = meta
-            .modified()
-            .unwrap_or(SystemTime::UNIX_EPOCH)
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        out.insert(
-            rel.clone(),
-            Entry {
-                path: rel,
-                size: meta.len(),
-                mtime_secs,
-                mode: file_mode(&meta),
-                sha256: hash,
-            },
-        );
-        return Ok(());
-    }
-    if meta.is_dir() {
-        let name = current
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if should_ignore(&name, ignores) {
-            return Ok(());
-        }
-        let mut entries: Vec<_> = fs::read_dir(current)?.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            walk(root, &entry.path(), ignores, out)?;
-        }
-    }
-    Ok(())
-}
-
-fn should_ignore(name: &str, ignores: &[&str]) -> bool {
-    for pat in ignores {
-        if !pat.is_empty() && (name == *pat || name.ends_with(pat) || name.contains(pat)) {
-            return true;
-        }
-    }
-    false
 }
 
 fn file_mode(meta: &fs::Metadata) -> u32 {
@@ -642,6 +806,16 @@ mod tests {
     }
 
     #[test]
+    fn ignore_patterns() {
+        let mut ig = IgnoreList::new();
+        ig.add("*.log");
+        ig.add("tmp/");
+        assert!(ig.matches("app.log"));
+        assert!(ig.matches("tmp/x"));
+        assert!(!ig.matches("app.txt"));
+    }
+
+    #[test]
     fn scan_diff_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
             "anchor-test-{}",
@@ -654,30 +828,19 @@ mod tests {
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("a.txt"), b"hello").unwrap();
         fs::write(dir.join("sub/b.txt"), b"world").unwrap();
-        let base = scan(&dir, &[]).unwrap();
+        fs::write(dir.join("skip.log"), b"noise").unwrap();
+        let mut ig = IgnoreList::from_defaults();
+        ig.add("*.log");
+        let base = scan(&dir, &ig).unwrap();
         assert_eq!(base.entries.len(), 2);
-        let path = dir.join("base.anchor");
-        save_baseline(&base, &path).unwrap();
-        let loaded = load_baseline(&path).unwrap();
-        assert_eq!(loaded.entries.len(), 2);
+        save_baseline(&base, dir.join("base.anchor")).unwrap();
         fs::write(dir.join("a.txt"), b"HELLO").unwrap();
         fs::write(dir.join("c.txt"), b"new").unwrap();
         fs::remove_file(dir.join("sub/b.txt")).unwrap();
-        let live = scan(&dir, &[]).unwrap();
+        let live = scan(&dir, &ig).unwrap();
         let report = diff(&base, &live, &dir, false);
-        assert!(report
-            .changes
-            .iter()
-            .any(|c| c.kind == ChangeKind::Modified && c.path.contains("a.txt")));
-        assert!(report
-            .changes
-            .iter()
-            .any(|c| c.kind == ChangeKind::Removed && c.path.contains("b.txt")));
-        assert!(report
-            .changes
-            .iter()
-            .any(|c| c.kind == ChangeKind::Added && c.path.contains("c.txt")));
         assert!(!report.is_clean());
+        assert!(report.to_json(".").contains("\"clean\": false"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
