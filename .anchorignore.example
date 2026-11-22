@@ -1,0 +1,7 @@
+# Copy to the tree you monitor as `.anchorignore`
+*.log
+*.tmp
+*.swp
+tmp/
+cache/
+.DS_Store
