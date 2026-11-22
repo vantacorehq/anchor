@@ -1,7 +1,7 @@
 //! anchor — file integrity monitor CLI.
 
 use anchor::{
-    diff, hash_path, load_baseline, post_webhook, save_baseline, scan, webhook_payload,
+    diff, hash_path, load_baseline, post_webhook, save_baseline, scan, webhook_payload, IgnoreList,
     Report,
 };
 use std::env;
@@ -20,6 +20,7 @@ fn main() {
         "init" | "baseline" => cmd_init(&args[1..]),
         "check" => cmd_check(&args[1..]),
         "watch" => cmd_watch(&args[1..]),
+        "status" => cmd_status(&args[1..]),
         "hash" => cmd_hash(&args[1..]),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -30,16 +31,15 @@ fn main() {
     }
 }
 
-fn default_ignores() -> Vec<&'static str> {
-    vec![".git", ".anchor", "target", "node_modules", ".DS_Store", "Cargo.lock"]
-}
-
 struct Flags {
     root: PathBuf,
     baseline: PathBuf,
     webhook: Option<String>,
     show_diff: bool,
+    json: bool,
+    quiet: bool,
     interval_ms: u64,
+    extra_ignores: Vec<String>,
 }
 
 fn parse_flags(args: &[String], defaults_root: &str, defaults_base: &str) -> Flags {
@@ -47,7 +47,10 @@ fn parse_flags(args: &[String], defaults_root: &str, defaults_base: &str) -> Fla
     let mut baseline = PathBuf::from(defaults_base);
     let mut webhook = None;
     let mut show_diff = false;
+    let mut json = false;
+    let mut quiet = false;
     let mut interval_ms = 1000u64;
+    let mut extra_ignores = Vec::new();
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -58,7 +61,15 @@ fn parse_flags(args: &[String], defaults_root: &str, defaults_base: &str) -> Fla
                     webhook = Some(args[i].clone());
                 }
             }
+            "--ignore" => {
+                i += 1;
+                if i < args.len() {
+                    extra_ignores.push(args[i].clone());
+                }
+            }
             "--diff" => show_diff = true,
+            "--json" => json = true,
+            "--quiet" | "-q" => quiet = true,
             "--interval" => {
                 i += 1;
                 if i < args.len() {
@@ -83,13 +94,32 @@ fn parse_flags(args: &[String], defaults_root: &str, defaults_base: &str) -> Fla
     if let Some(b) = positional.get(1) {
         baseline = PathBuf::from(b);
     }
-    Flags { root, baseline, webhook, show_diff, interval_ms }
+    Flags {
+        root,
+        baseline,
+        webhook,
+        show_diff,
+        json,
+        quiet,
+        interval_ms,
+        extra_ignores,
+    }
+}
+
+fn build_ignores(f: &Flags) -> IgnoreList {
+    let mut ig = IgnoreList::for_root(&f.root);
+    for p in &f.extra_ignores {
+        ig.add(p);
+    }
+    ig
 }
 
 fn cmd_init(args: &[String]) {
     let f = parse_flags(args, ".", ".anchor/baseline");
-    let ignores = default_ignores();
-    eprintln!("scanning {} …", f.root.display());
+    let ignores = build_ignores(&f);
+    if !f.quiet {
+        eprintln!("scanning {} …", f.root.display());
+    }
     match scan(&f.root, &ignores) {
         Ok(base) => {
             if let Some(parent) = f.baseline.parent() {
@@ -99,7 +129,11 @@ fn cmd_init(args: &[String]) {
                 eprintln!("write failed: {}", e);
                 process::exit(2);
             }
-            println!("baseline: {} files → {}", base.entries.len(), f.baseline.display());
+            println!(
+                "baseline: {} files → {}",
+                base.entries.len(),
+                f.baseline.display()
+            );
         }
         Err(e) => {
             eprintln!("scan failed: {}", e);
@@ -110,7 +144,7 @@ fn cmd_init(args: &[String]) {
 
 fn cmd_check(args: &[String]) {
     let f = parse_flags(args, ".", ".anchor/baseline");
-    let ignores = default_ignores();
+    let ignores = build_ignores(&f);
     let baseline = match load_baseline(&f.baseline) {
         Ok(b) => b,
         Err(e) => {
@@ -118,7 +152,13 @@ fn cmd_check(args: &[String]) {
             process::exit(2);
         }
     };
-    eprintln!("checking {} against {} …", f.root.display(), f.baseline.display());
+    if !f.quiet {
+        eprintln!(
+            "checking {} against {} …",
+            f.root.display(),
+            f.baseline.display()
+        );
+    }
     let live = match scan(&f.root, &ignores) {
         Ok(b) => b,
         Err(e) => {
@@ -127,33 +167,76 @@ fn cmd_check(args: &[String]) {
         }
     };
     let report = diff(&baseline, &live, &f.root, f.show_diff);
-    print_report(&report, f.show_diff);
-    if !report.is_clean() {
-        if let Some(ref url) = f.webhook {
-            let body = webhook_payload(&report, &f.root.display().to_string());
-            if let Err(e) = post_webhook(url, &body) {
-                eprintln!("webhook failed: {}", e);
-            } else {
-                eprintln!("webhook sent → {}", url);
-            }
+    emit_report(&report, &f);
+    maybe_webhook(&report, &f);
+    process::exit(if report.is_clean() { 0 } else { 1 });
+}
+
+fn cmd_status(args: &[String]) {
+    let f = parse_flags(args, ".", ".anchor/baseline");
+    let ignores = build_ignores(&f);
+    let baseline = match load_baseline(&f.baseline) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("load baseline: {}", e);
+            process::exit(2);
         }
-    }
-    if report.is_clean() {
-        println!("ok — {} files unchanged", report.unchanged);
-        process::exit(0);
+    };
+    let live = match scan(&f.root, &ignores) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("scan failed: {}", e);
+            process::exit(2);
+        }
+    };
+    let report = diff(&baseline, &live, &f.root, false);
+    if f.json {
+        print!("{}", report.to_json(&f.root.display().to_string()));
     } else {
-        println!("FAIL — {} issue(s), {} unchanged", report.total_issues(), report.unchanged);
-        process::exit(1);
+        let added = report
+            .changes
+            .iter()
+            .filter(|c| c.kind == anchor::ChangeKind::Added)
+            .count();
+        let removed = report
+            .changes
+            .iter()
+            .filter(|c| c.kind == anchor::ChangeKind::Removed)
+            .count();
+        let modified = report
+            .changes
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    anchor::ChangeKind::Modified | anchor::ChangeKind::ModeChanged
+                )
+            })
+            .count();
+        println!(
+            "root={} baseline={} files={} unchanged={} +{} ~{} -{} {}",
+            f.root.display(),
+            f.baseline.display(),
+            baseline.entries.len(),
+            report.unchanged,
+            added,
+            modified,
+            removed,
+            if report.is_clean() { "OK" } else { "DRIFT" }
+        );
     }
+    process::exit(if report.is_clean() { 0 } else { 1 });
 }
 
 fn cmd_watch(args: &[String]) {
     let f = parse_flags(args, ".", ".anchor/baseline");
-    let ignores = default_ignores();
+    let ignores = build_ignores(&f);
     let mut baseline = match load_baseline(&f.baseline) {
         Ok(b) => b,
         Err(_) => {
-            eprintln!("no baseline — creating {}", f.baseline.display());
+            if !f.quiet {
+                eprintln!("no baseline — creating {}", f.baseline.display());
+            }
             let b = scan(&f.root, &ignores).unwrap_or_else(|e| {
                 eprintln!("scan failed: {}", e);
                 process::exit(2);
@@ -165,14 +248,18 @@ fn cmd_watch(args: &[String]) {
             b
         }
     };
-    eprintln!(
-        "watching {} every {}ms (baseline {}, {} files)",
-        f.root.display(), f.interval_ms, f.baseline.display(), baseline.entries.len()
-    );
-    if let Some(ref url) = f.webhook {
-        eprintln!("webhook: {}", url);
+    if !f.quiet {
+        eprintln!(
+            "watching {} every {}ms ({} files)",
+            f.root.display(),
+            f.interval_ms,
+            baseline.entries.len()
+        );
+        if let Some(ref url) = f.webhook {
+            eprintln!("webhook: {}", url);
+        }
+        eprintln!("press Ctrl+C to stop\n");
     }
-    eprintln!("press Ctrl+C to stop\n");
     loop {
         thread::sleep(Duration::from_millis(f.interval_ms));
         let live = match scan(&f.root, &ignores) {
@@ -186,34 +273,61 @@ fn cmd_watch(args: &[String]) {
         if report.is_clean() {
             continue;
         }
-        for c in &report.changes {
-            print!("[{}] {} {}", stamp(), c.kind.marker(), c.path);
-            if f.show_diff {
-                if let (Some(o), Some(n)) = (&c.old_hash, &c.new_hash) {
-                    print!("  {}→{}", &o[..12.min(o.len())], &n[..12.min(n.len())]);
-                }
-                if let (Some(om), Some(nm)) = (c.old_mode, c.new_mode) {
-                    if om != nm {
-                        print!("  mode {:o}→{:o}", om, nm);
+        if f.json {
+            print!("{}", report.to_json(&f.root.display().to_string()));
+        } else {
+            for c in &report.changes {
+                print!("[{}] {} {}", stamp(), c.kind.marker(), c.path);
+                if f.show_diff {
+                    if let (Some(o), Some(n)) = (&c.old_hash, &c.new_hash) {
+                        print!(
+                            "  {}→{}",
+                            &o[..12.min(o.len())],
+                            &n[..12.min(n.len())]
+                        );
+                    }
+                    if let (Some(om), Some(nm)) = (c.old_mode, c.new_mode) {
+                        if om != nm {
+                            print!("  mode {:o}→{:o}", om, nm);
+                        }
                     }
                 }
-            }
-            println!();
-            if f.show_diff {
-                if let Some(ref d) = c.content_diff {
-                    for line in d.lines().take(20) {
-                        println!("      {}", line);
-                    }
-                }
+                println!();
             }
         }
         baseline = live;
         let _ = save_baseline(&baseline, &f.baseline);
-        if let Some(ref url) = f.webhook {
-            let body = webhook_payload(&report, &f.root.display().to_string());
-            if let Err(e) = post_webhook(url, &body) {
-                eprintln!("webhook failed: {}", e);
-            }
+        maybe_webhook(&report, &f);
+    }
+}
+
+fn emit_report(report: &Report, f: &Flags) {
+    if f.json {
+        print!("{}", report.to_json(&f.root.display().to_string()));
+        return;
+    }
+    print_report(report, f.show_diff);
+    if report.is_clean() {
+        println!("ok — {} files unchanged", report.unchanged);
+    } else {
+        println!(
+            "FAIL — {} issue(s), {} unchanged",
+            report.total_issues(),
+            report.unchanged
+        );
+    }
+}
+
+fn maybe_webhook(report: &Report, f: &Flags) {
+    if report.is_clean() {
+        return;
+    }
+    if let Some(ref url) = f.webhook {
+        let body = webhook_payload(report, &f.root.display().to_string());
+        if let Err(e) = post_webhook(url, &body) {
+            eprintln!("webhook failed: {}", e);
+        } else if !f.quiet {
+            eprintln!("webhook sent → {}", url);
         }
     }
 }
@@ -250,7 +364,11 @@ fn print_report(r: &Report, show_diff: bool) {
         println!("  {} {}", c.kind.marker(), c.path);
         if show_diff {
             if let (Some(o), Some(n)) = (&c.old_hash, &c.new_hash) {
-                println!("      hash {} → {}", &o[..12.min(o.len())], &n[..12.min(n.len())]);
+                println!(
+                    "      hash {} → {}",
+                    &o[..12.min(o.len())],
+                    &n[..12.min(n.len())]
+                );
             }
             if let (Some(om), Some(nm)) = (c.old_mode, c.new_mode) {
                 if om != nm {
@@ -270,15 +388,19 @@ fn usage() {
     eprintln!(
         "\x1b[1manchor\x1b[0m — file integrity monitor\n\n\
          \x1b[1mUsage:\x1b[0m\n\
-           anchor init  [dir] [baseline]   create baseline\n\
-           anchor check [dir] [baseline]   compare live tree to baseline\n\
-           anchor watch [dir] [baseline]   live poll daemon\n\
-           anchor hash  <file>             print SHA-256\n\n\
+           anchor init   [dir] [baseline]   create baseline\n\
+           anchor check  [dir] [baseline]   compare tree to baseline\n\
+           anchor status [dir] [baseline]   one-line summary\n\
+           anchor watch  [dir] [baseline]   live poll daemon\n\
+           anchor hash   <file>             print SHA-256\n\n\
          \x1b[1mFlags:\x1b[0m\n\
-           --diff                 show hash / mode / content hints\n\
-           --webhook <url>        POST JSON alert\n\
-           --interval <ms>        watch poll interval (default 1000)\n\n\
-         Exit: 0 clean · 1 drift · 2 error\n\
+           --diff              hash / mode / content hints\n\
+           --json              machine-readable report\n\
+           --quiet / -q        less stderr chatter\n\
+           --ignore <pat>      extra ignore (also reads .anchorignore)\n\
+           --webhook <url>     POST JSON alert on drift\n\
+           --interval <ms>     watch poll interval (default 1000)\n\n\
+         Exit: 0 clean \u00b7 1 drift \u00b7 2 error\n\
          Zero dependencies. Pure Rust."
     );
 }
